@@ -2,15 +2,14 @@ package http
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"time"
-	"expvar"
 
 	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/logp"
@@ -71,8 +70,8 @@ type Connection struct {
 	http              *http.Client
 	onConnectCallback func() error
 
-	encoder bodyEncoder
-	version string
+	encoder   bodyEncoder
+	version   string
 	connected bool
 }
 
@@ -269,7 +268,6 @@ func (client *Client) Publish(batch publisher.Batch) error {
 	return nil
 }
 
-
 // PublishEvents posts all events to the http endpoint. On error a slice with all
 // events not published will be returned.
 func (client *Client) publishEvents(
@@ -340,6 +338,7 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 
 	return nil
 }
+
 // PublishEvents sends all events to elasticsearch. On error a slice with all
 // events not published or confirmed to be processed by elasticsearch will be
 // returned. The input slice backing memory will be reused by return the value.
@@ -690,11 +689,6 @@ func (client *Client) LoadJSON(path string, json map[string]interface{}) ([]byte
 	return body, nil
 }
 
-// GetVersion returns the elasticsearch version the client is connected to
-func (client *Client) GetVersion() string {
-	return client.Connection.version
-}
-
 func (client *Client) Test(d testing.Driver) {
 	d.Run("elasticsearch: "+client.URL, func(d testing.Driver) {
 		u, err := url.Parse(client.URL)
@@ -730,8 +724,7 @@ func (client *Client) Test(d testing.Driver) {
 // Connect connects the client.
 func (conn *Connection) Connect() error {
 	var err error
-	//conn.version, err = conn.Ping()
-	conn.connected = true
+	conn.connected, err = conn.Ping()
 	if err != nil {
 		return err
 	}
@@ -743,34 +736,25 @@ func (conn *Connection) Connect() error {
 	return nil
 }
 
-// Ping sends a GET request to the Elasticsearch.
-func (conn *Connection) Ping() (string, error) {
-	debugf("ES Ping(url=%v)", conn.URL)
+// Ping sends a GET request to the endpoint.
+func (conn *Connection) Ping() (bool, error) {
+	debugf("HTTP Ping(url=%v)", conn.URL)
 
-	status, body, err := conn.execRequest("GET", conn.URL, nil)
+	status, _, err := conn.execRequest("GET", conn.URL, nil)
 	if err != nil {
 		debugf("Ping request failed with: %v", err)
-		return "", err
+		return false, err
 	}
 
 	if status >= 300 {
-		return "", fmt.Errorf("Non 2xx response code: %d", status)
+		return false, fmt.Errorf("Non 2xx response code: %d", status)
 	}
 
-	var response struct {
-		Version struct {
-			Number string
-		}
+	if status != 200 {
+		return false, fmt.Errorf("Could not connect to %s, got response code: %d", conn.URL, status)
 	}
 
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return "", fmt.Errorf("Failed to parse JSON response: %v", err)
-	}
-
-	debugf("Ping status code: %v", status)
-	logp.Info("Connected to Elasticsearch version %s", response.Version.Number)
-	return response.Version.Number, nil
+	return true, nil
 }
 
 // Close closes a connection.
@@ -880,10 +864,6 @@ func (conn *Connection) execHTTPRequest(req *http.Request) (int, []byte, error) 
 	}
 
 	return status, obj, err
-}
-
-func (conn *Connection) GetVersion() string {
-	return conn.version
 }
 
 func closing(c io.Closer) {
