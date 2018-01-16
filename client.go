@@ -1,7 +1,6 @@
 package http
 
 import (
-	"bytes"
 	"errors"
 	"expvar"
 	"fmt"
@@ -75,55 +74,10 @@ type Connection struct {
 	connected bool
 }
 
-type bulkIndexAction struct {
-	Index bulkEventMeta `json:"index" struct:"index"`
-}
-
-type bulkCreateAction struct {
-	Create bulkEventMeta `json:"create" struct:"create"`
-}
-
-type bulkEventMeta struct {
-	Index    string `json:"_index" struct:"_index"`
-	DocType  string `json:"_type" struct:"_type"`
-	Pipeline string `json:"pipeline,omitempty" struct:"pipeline,omitempty"`
-	ID       string `json:"_id,omitempty" struct:"_id,omitempty"`
-}
-
-type bulkResultStats struct {
-	acked        int // number of events ACKed by Elasticsearch
-	duplicates   int // number of events failed with `create` due to ID already being indexed
-	fails        int // number of failed events (can be retried)
-	nonIndexable int // number of failed events (not indexable -> must be dropped)
-}
-
 var (
 	ackedEvents            = expvar.NewInt("libbeatHttpPublishedAndAckedEvents")
 	eventsNotAcked         = expvar.NewInt("libbeatHttpPublishedButNotAckedEvents")
 	publishEventsCallCount = expvar.NewInt("libbeatHttpPublishEventsCallCount")
-
-	statReadBytes   = expvar.NewInt("libbeatHttpPublishReadBytes")
-	statWriteBytes  = expvar.NewInt("libbeatHttpPublishWriteBytes")
-	statReadErrors  = expvar.NewInt("libbeatHttpPublishReadErrors")
-	statWriteErrors = expvar.NewInt("libbeatHttpPublishWriteErrors")
-)
-
-var (
-	nameItems  = []byte("items")
-	nameStatus = []byte("status")
-	nameError  = []byte("error")
-)
-
-var (
-	errExpectedItemObject    = errors.New("expected item response object")
-	errExpectedStatusCode    = errors.New("expected item status code")
-	errUnexpectedEmptyObject = errors.New("empty object")
-	errExpectedObjectEnd     = errors.New("expected end of object")
-	errTempBulkFailure       = errors.New("temporary bulk send failure")
-)
-
-const (
-	eventType = "doc"
 )
 
 // NewClient instantiates a new client.
@@ -339,149 +293,6 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 	return nil
 }
 
-// PublishEvents sends all events to elasticsearch. On error a slice with all
-// events not published or confirmed to be processed by elasticsearch will be
-// returned. The input slice backing memory will be reused by return the value.
-// func (client *Client) publishEvents(
-// 	data []publisher.Event,
-// ) ([]publisher.Event, error) {
-// 	begin := time.Now()
-// 	st := client.observer
-//
-// 	if st != nil {
-// 		st.NewBatch(len(data))
-// 	}
-//
-// 	if len(data) == 0 {
-// 		return nil, nil
-// 	}
-//
-// 	body := client.encoder
-// 	body.Reset()
-//
-// 	// encode events into bulk request buffer, dropping failed elements from
-// 	// events slice
-//
-// 	origCount := len(data)
-// 	data = bulkEncodePublishRequest(body, client.index, client.pipeline, data)
-// 	newCount := len(data)
-// 	if st != nil && origCount > newCount {
-// 		st.Dropped(origCount - newCount)
-// 	}
-// 	if newCount == 0 {
-// 		return nil, nil
-// 	}
-//
-// 	requ := client.bulkRequ
-// 	requ.Reset(body)
-// 	status, result, sendErr := client.sendBulkRequest(requ)
-// 	if sendErr != nil {
-// 		logp.Err("Failed to perform any bulk index operations: %s", sendErr)
-// 		return data, sendErr
-// 	}
-//
-// 	debugf("PublishEvents: %d events have been  published to elasticsearch in %v.",
-// 		len(data),
-// 		time.Now().Sub(begin))
-//
-// 	// check response for transient errors
-// 	var failedEvents []publisher.Event
-// 	var stats bulkResultStats
-// 	if status != 200 {
-// 		failedEvents = data
-// 		stats.fails = len(failedEvents)
-// 	} else {
-// 		client.json.init(result.raw)
-// 		failedEvents, stats = bulkCollectPublishFails(&client.json, data)
-// 	}
-//
-// 	failed := len(failedEvents)
-// 	if st := client.observer; st != nil {
-// 		dropped := stats.nonIndexable
-// 		duplicates := stats.duplicates
-// 		acked := len(data) - failed - dropped - duplicates
-//
-// 		st.Acked(acked)
-// 		st.Failed(failed)
-// 		st.Dropped(dropped)
-// 		st.Duplicate(duplicates)
-// 	}
-//
-// 	if failed > 0 {
-// 		if sendErr == nil {
-// 			sendErr = errTempBulkFailure
-// 		}
-// 		return failedEvents, sendErr
-// 	}
-// 	return nil, nil
-// }
-
-// fillBulkRequest encodes all bulk requests and returns slice of events
-// successfully added to bulk request.
-func bulkEncodePublishRequest(
-	body bulkWriter,
-	index outil.Selector,
-	pipeline *outil.Selector,
-	data []publisher.Event,
-) []publisher.Event {
-	okEvents := data[:0]
-	for i := range data {
-		event := &data[i].Content
-		meta, err := createEventBulkMeta(index, pipeline, event)
-		if err != nil {
-			logp.Err("Failed to encode event meta data: %s", err)
-			continue
-		}
-		if err := body.Add(meta, event); err != nil {
-			logp.Err("Failed to encode event: %s", err)
-			continue
-		}
-		okEvents = append(okEvents, data[i])
-	}
-	return okEvents
-}
-
-func createEventBulkMeta(
-	indexSel outil.Selector,
-	pipelineSel *outil.Selector,
-	event *beat.Event,
-) (interface{}, error) {
-	pipeline, err := getPipeline(event, pipelineSel)
-	if err != nil {
-		err := fmt.Errorf("failed to select pipeline: %v", err)
-		return nil, err
-	}
-
-	index, err := getIndex(event, indexSel)
-	if err != nil {
-		err := fmt.Errorf("failed to select event index: %v", err)
-		return nil, err
-	}
-
-	var id string
-	if m := event.Meta; m != nil {
-		if tmp := m["id"]; tmp != nil {
-			if s, ok := tmp.(string); ok {
-				id = s
-			} else {
-				logp.Err("Event ID '%v' is no string value", id)
-			}
-		}
-	}
-
-	meta := bulkEventMeta{
-		Index:    index,
-		DocType:  eventType,
-		Pipeline: pipeline,
-		ID:       id,
-	}
-
-	if id != "" {
-		return bulkCreateAction{meta}, nil
-	}
-	return bulkIndexAction{meta}, nil
-}
-
 func getPipeline(event *beat.Event, pipelineSel *outil.Selector) (string, error) {
 	if event.Meta != nil {
 		if pipeline, exists := event.Meta["pipeline"]; exists {
@@ -514,179 +325,6 @@ func getIndex(event *beat.Event, index outil.Selector) (string, error) {
 	}
 
 	return index.Select(event)
-}
-
-// bulkCollectPublishFails checks per item errors returning all events
-// to be tried again due to error code returned for that items. If indexing an
-// event failed due to some error in the event itself (e.g. does not respect mapping),
-// the event will be dropped.
-func bulkCollectPublishFails(
-	reader *jsonReader,
-	data []publisher.Event,
-) ([]publisher.Event, bulkResultStats) {
-	if err := reader.expectDict(); err != nil {
-		logp.Err("Failed to parse bulk respose: expected JSON object")
-		return nil, bulkResultStats{}
-	}
-
-	// find 'items' field in response
-	for {
-		kind, name, err := reader.nextFieldName()
-		if err != nil {
-			logp.Err("Failed to parse bulk response")
-			return nil, bulkResultStats{}
-		}
-
-		if kind == dictEnd {
-			logp.Err("Failed to parse bulk response: no 'items' field in response")
-			return nil, bulkResultStats{}
-		}
-
-		// found items array -> continue
-		if bytes.Equal(name, nameItems) {
-			break
-		}
-
-		reader.ignoreNext()
-	}
-
-	// check items field is an array
-	if err := reader.expectArray(); err != nil {
-		logp.Err("Failed to parse bulk respose: expected items array")
-		return nil, bulkResultStats{}
-	}
-
-	count := len(data)
-	failed := data[:0]
-	stats := bulkResultStats{}
-	for i := 0; i < count; i++ {
-		status, msg, err := itemStatus(reader)
-		if err != nil {
-			return nil, bulkResultStats{}
-		}
-
-		if status < 300 {
-			stats.acked++
-			continue // ok value
-		}
-
-		if status == 409 {
-			// 409 is used to indicate an event with same ID already exists if
-			// `create` op_type is used.
-			stats.duplicates++
-			continue // ok
-		}
-
-		if status < 500 && status != 429 {
-			// hard failure, don't collect
-			logp.Warn("Cannot index event %#v (status=%v): %s", data[i], status, msg)
-			stats.nonIndexable++
-			continue
-		}
-
-		debugf("Bulk item insert failed (i=%v, status=%v): %s", i, status, msg)
-		stats.fails++
-		failed = append(failed, data[i])
-	}
-
-	return failed, stats
-}
-
-func itemStatus(reader *jsonReader) (int, []byte, error) {
-	// skip outer dictionary
-	if err := reader.expectDict(); err != nil {
-		return 0, nil, errExpectedItemObject
-	}
-
-	// find first field in outer dictionary (e.g. 'create')
-	kind, _, err := reader.nextFieldName()
-	if err != nil {
-		logp.Err("Failed to parse bulk response item: %s", err)
-		return 0, nil, err
-	}
-	if kind == dictEnd {
-		err = errUnexpectedEmptyObject
-		logp.Err("Failed to parse bulk response item: %s", err)
-		return 0, nil, err
-	}
-
-	// parse actual item response code and error message
-	status, msg, err := itemStatusInner(reader)
-	if err != nil {
-		logp.Err("Failed to parse bulk response item: %s", err)
-		return 0, nil, err
-	}
-
-	// close dictionary. Expect outer dictionary to have only one element
-	kind, _, err = reader.step()
-	if err != nil {
-		logp.Err("Failed to parse bulk response item: %s", err)
-		return 0, nil, err
-	}
-	if kind != dictEnd {
-		err = errExpectedObjectEnd
-		logp.Err("Failed to parse bulk response item: %s", err)
-		return 0, nil, err
-	}
-
-	return status, msg, nil
-}
-
-func itemStatusInner(reader *jsonReader) (int, []byte, error) {
-	if err := reader.expectDict(); err != nil {
-		return 0, nil, errExpectedItemObject
-	}
-
-	status := -1
-	var msg []byte
-	for {
-		kind, name, err := reader.nextFieldName()
-		if err != nil {
-			logp.Err("Failed to parse bulk response item: %s", err)
-		}
-		if kind == dictEnd {
-			break
-		}
-
-		switch {
-		case bytes.Equal(name, nameStatus): // name == "status"
-			status, err = reader.nextInt()
-			if err != nil {
-				logp.Err("Failed to parse bulk response item: %s", err)
-				return 0, nil, err
-			}
-
-		case bytes.Equal(name, nameError): // name == "error"
-			msg, err = reader.ignoreNext() // collect raw string for "error" field
-			if err != nil {
-				return 0, nil, err
-			}
-
-		default: // ignore unknown fields
-			_, err = reader.ignoreNext()
-			if err != nil {
-				return 0, nil, err
-			}
-		}
-	}
-
-	if status < 0 {
-		return 0, nil, errExpectedStatusCode
-	}
-	return status, msg, nil
-}
-
-// LoadJSON creates a PUT request based on a JSON document.
-func (client *Client) LoadJSON(path string, json map[string]interface{}) ([]byte, error) {
-	status, body, err := client.Request("PUT", path, "", nil, json)
-	if err != nil {
-		return body, fmt.Errorf("couldn't load json. Error: %s", err)
-	}
-	if status > 300 {
-		return body, fmt.Errorf("couldn't load json. Status: %v", status)
-	}
-
-	return body, nil
 }
 
 func (client *Client) Test(d testing.Driver) {
@@ -762,20 +400,6 @@ func (conn *Connection) Close() error {
 	return nil
 }
 
-// Request sends a request via the connection.
-func (conn *Connection) Request(
-	method, path string,
-	pipeline string,
-	params map[string]string,
-	body interface{},
-) (int, []byte, error) {
-
-	url := addToURL(conn.URL, path, pipeline, params)
-	debugf("%s %s %s %v", method, url, pipeline, body)
-
-	return conn.RequestURL(method, url, body)
-}
-
 // RequestURL sends a request with the connection object to an alternative url
 func (conn *Connection) RequestURL(
 	method, url string,
@@ -810,6 +434,20 @@ func (conn *Connection) request(
 		return 0, nil, ErrJSONEncodeFailed
 	}
 	return conn.execRequest(method, url, conn.encoder.Reader())
+}
+
+// Request sends a request via the connection.
+func (conn *Connection) Request(
+	method, path string,
+	pipeline string,
+	params map[string]string,
+	body interface{},
+) (int, []byte, error) {
+
+	url := addToURL(conn.URL, path, pipeline, params)
+	debugf("%s %s %s %v", method, url, pipeline, body)
+
+	return conn.RequestURL(method, url, body)
 }
 
 func (conn *Connection) execRequest(
